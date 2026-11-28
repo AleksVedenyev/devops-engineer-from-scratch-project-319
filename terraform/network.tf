@@ -97,8 +97,8 @@ resource "yandex_vpc_security_group" "k8s-nodegroup-traffic" {
     to_port     = 65535
     protocol    = "ANY"
     v4_cidr_blocks = [
-      [local.k8s_pod_cidr],
-      [local.k8s_service_cidr]
+      local.k8s_pod_cidr,
+      local.k8s_service_cidr
     ]
   }
   egress {
@@ -143,7 +143,7 @@ resource "yandex_vpc_security_group" "k8s-cluster-traffic" {
     description    = "Правило для исходящего трафика, разрешающее передачу трафика между мастером и подами metric-server."
     port           = 4443
     protocol       = "TCP"
-    v4_cidr_blocks = [k8s_pod_cidr]
+    v4_cidr_blocks = [local.k8s_pod_cidr]
   }
   egress {
     description    = "Правило для исходящего трафика, разрешающее подключение мастера к NTP-серверам для синхронизации времени."
