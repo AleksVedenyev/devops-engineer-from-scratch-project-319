@@ -23,6 +23,7 @@ Terraform-конфигурация для приложения. Создаёт:
 - [Yandex Cloud CLI (`yc`)](https://yandex.cloud/ru/docs/cli/quickstart#install)
 - `make`
 - `kubectl` для работы с кластером после создания
+- `envsubst` (входит в пакет `gettext`) для подстановки значений в шаблоны манифестов
 - Аккаунт в Yandex Cloud с созданными облаком и каталогом и правами на создание ресурсов (`admin` на каталог либо набор ролей на сеть, Kubernetes, PostgreSQL, Object Storage, Lockbox и IAM)
 
 > Если `registry.terraform.io` недоступен, используйте [зеркало Яндекса](https://yandex.cloud/ru/blog/posts/2022/03/terraform-and-packer). Создайте файл `~/.terraformrc`:
@@ -69,9 +70,36 @@ yc iam access-key create --service-account-name tf-backend-sa
 yc storage bucket create --name <имя-бакета-из-backend.tf>
 ```
 
+### 3. Конфигурационные файлы
+
+#### Идентификаторы облака и каталога
+
+`terraform/terraform.tfvars` лежит в репозитории: идентификаторы не являются учётными данными. Перед первым запуском укажите в нём свои значения:
+
+```hcl
+yc_cloud_id  = "<cloud-id>"
+yc_folder_id = "<folder-id>"
+```
+
+Узнать значения можно командами `yc config get cloud-id` и `yc config get folder-id`. Terraform подхватывает `terraform.tfvars` автоматически, поэтому в командах `make` флаг `-var-file` не нужен.
+
 ### 3. Файлы с секретами
 
 Оба файла перечислены в `.gitignore` (маска `secret.*`) и не должны попадать в репозиторий.
+
+`terraform/secret.backend.tfvars` — доступ к бакету состояния:
+
+```hcl
+key        = "terraform.tfstate"      # путь к файлу состояния внутри бакета
+access_key = "<key_id из шага 2>"
+secret_key = "<secret из шага 2>"
+```
+
+Шаблон лежит в `terraform/example.secret.backend.tfvars`.
+
+#### Доступы к бэкенду состояния
+
+Файл перечислен в `.gitignore` (маска `secret.*`) и не должен попадать в репозиторий.
 
 `terraform/secret.backend.tfvars` — доступ к бакету состояния:
 
@@ -206,8 +234,81 @@ yc lockbox payload get \
   --key SPRING_DATASOURCE_PASSWORD
 ```
 
+## Деплой приложения в Kubernetes
+
+Манифесты лежат в каталоге `k8s/`:
+
+Значения для ConfigMap и Secret в репозитории не хранятся. Шаблоны `*.tpl` содержат плейсхолдеры `${...}`, а реальные значения берутся из Lockbox и outputs Terraform в момент деплоя, подставляются через `envsubst` и передаются в `kubectl apply` через pipe, на диск результат не пишется. Из-за расширения `.tpl` команда `kubectl apply -f k8s/` шаблоны не применит, используйте `make`-цели ниже.
+
+Образ приложения: `aleksved/project-devops-deploy:latest` (Docker Hub).
+
+### Предварительные условия
+
+1. Инфраструктура создана (`make apply`).
+2. Получен kubeconfig (см. раздел «Доступ к кластеру Kubernetes»).
+3. У пользователя есть право читать секрет Lockbox (например, роль `lockbox.payloadViewer`).
+
+### Деплой
+
+```bash
+make k8s-deploy
+```
+
+Цель последовательно выполняет:
+
+1. `kubectl apply -f k8s/app-namespace.yml`: создаёт namespace `app`;
+2. `make configmap`: формирует ConfigMap из шаблона и применяет его;
+3. `make secret`: формирует Secret из шаблона и применяет его;
+4. `kubectl apply -f k8s/app-deployment.yml` и `kubectl apply -f k8s/app-service.yml`;
+5. `kubectl rollout status deployment/app-deployment`: ждёт, пока поды станут Ready.
+
+Порядок важен: ConfigMap и Secret должны существовать до того, как поды Deployment попытаются их подключить.
+
+| Команда | Что делает |
+|---------|-----------|
+| `make k8s-deploy` | Полный выкат: namespace, ConfigMap, Secret, Deployment, Service |
+| `make configmap` | Применить только ConfigMap (значения из Lockbox и outputs Terraform) |
+| `make secret` | Применить только Secret (значения из Lockbox) |
+| `make rollout` | Перезапустить Deployment по стратегии RollingUpdate |
+| `make port-forward` | Временный доступ к приложению: `localhost:8080` |
+
+### Проверка
+
+```bash
+# поды в состоянии Running и Ready 1/1
+kubectl -n app get pods
+
+# ожидание завершения выката
+kubectl -n app rollout status deployment/app-deployment
+
+# логи приложения
+kubectl -n app logs deployment/app-deployment
+
+# временный доступ к приложению с рабочей машины (команда работает, пока не нажать Ctrl+C)
+make port-forward
+# в браузере http://localhost:8080 или в другом терминале:
+curl -I http://localhost:8080
+```
+
+Состояние приложения на служебном порту (его пробы используют readiness и liveness):
+
+```bash
+kubectl -n app port-forward deployment/app-deployment 9090:9090
+# в другом терминале:
+curl http://localhost:9090/actuator/health
+```
+
+### Обновление
+
+- **Новый образ.** Для тега `latest` по умолчанию действует `imagePullPolicy: Always`, поэтому `make rollout` перезапускает поды и они скачивают свежий образ.
+- **Изменение конфигурации.** Поды читают ConfigMap и Secret через `envFrom` при старте, поэтому после `make configmap` или `make secret` нужен `make rollout`.
+- **Ресурсы.** Во время обновления на ноде одновременно работают два пода: учитывайте это при выборе `requests` и размера ноды.
+
 ## Безопасность
 
 - Состояние Terraform хранится только в Object Storage и не коммитится. Оно содержит пароль БД и ключи S3, поэтому доступ к бакету состояния должен быть ограничен.
 - Файлы `secret.*` исключены из git через `.gitignore`.
+- В репозитории лежит `terraform.tfvars` с идентификаторами облака и каталога. Это не учётные данные: без токена они доступа не дают.
 - Файл `.terraform.lock.hcl` коммитится, чтобы версии провайдеров были воспроизводимы.
+- Сервисному аккаунту нод роли не назначены: образы для приложения берутся из публичного Docker Hub, а не из Yandex Container Registry.
+- Секретные значения для Kubernetes в репозитории не хранятся: Secret формируется из Lockbox в момент деплоя. Внутри кластера Secret хранится в base64 (это не шифрование), поэтому доступ к namespace `app` должен быть ограничен.
